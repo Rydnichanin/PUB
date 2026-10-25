@@ -1,10 +1,10 @@
-// Скопируйте этот файл в firebase-config.js и вставьте конфигурацию своего Firebase-проекта.
-// Реальные ключи Firebase Web обычно можно хранить во фронтенде; доступ защищается Firestore Rules.
-export const firebaseConfig = {
-  apiKey: "ВАШ_API_KEY",
-  authDomain: "ВАШ_PROJECT.firebaseapp.com",
-  projectId: "ВАШ_PROJECT_ID",
-  storageBucket: "ВАШ_PROJECT.firebasestorage.app",
-  messagingSenderId: "ВАШ_SENDER_ID",
-  appId: "ВАШ_APP_ID"
+// Скопируйте в firebase-config.js и вставьте параметры Firebase Web App.
+// API key Firebase Web является публичной конфигурацией, доступ защищается Auth и Firestore Rules.
+window.firebaseConfig = {
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_PROJECT.firebaseapp.com",
+  projectId: "YOUR_PROJECT_ID",
+  storageBucket: "YOUR_PROJECT.firebasestorage.app",
+  messagingSenderId: "YOUR_SENDER_ID",
+  appId: "YOUR_APP_ID"
 };
