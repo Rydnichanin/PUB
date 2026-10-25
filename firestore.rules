@@ -1,22 +1,58 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    // Model: users/{uid} holds private account data and role; customerDirectory/{uid}
+    // holds the minimal cashier CRM projection; orders/{id} contains delivery PII;
+    // restaurants/{id}/menu/{itemId} is public catalog data; settings/main are
+    // operational flags; tariffs, transactions retain the existing app model.
     function signedIn() { return request.auth != null; }
-    function userDoc() { return get(/databases/$(database)/documents/users/$(request.auth.uid)); }
-    function role(r) { return signedIn() && userDoc().data.role == r; }
-    function isAdmin() { return role('admin'); }
-    function isActive() { return signedIn() && userDoc().data.active != false; }
+    function userPath() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function hasProfile() { return signedIn() && exists(userPath()); }
+    function userDoc() { return get(userPath()); }
+    function hasRole(r) { return hasProfile() && userDoc().data.active != false && userDoc().data.role == r; }
+    function isBoss() { return hasRole('boss'); }
+    function isAdmin() { return isBoss() || hasRole('admin'); }
+    function isActive() { return hasProfile() && userDoc().data.active != false; }
+    function staff() { return isActive() && userDoc().data.role in ['boss','admin','cashier','kitchen','restaurant','courier','dispatcher']; }
+    function ownsRestaurant(id) {
+      return hasRole('restaurant') &&
+        get(/databases/$(database)/documents/restaurants/$(id)).data.ownerId == request.auth.uid;
+    }
+    function validRole(r) { return r in ['client','cashier','kitchen','restaurant','courier','dispatcher','admin','boss']; }
 
     match /users/{uid} {
+      // Registration is self-service and always creates a least-privilege client.
       allow create: if signedIn() && request.auth.uid == uid
-        && request.resource.data.role == 'client';
-      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
-      // A user may edit their profile, but cannot change role/active status.
-      allow update: if isAdmin()
+        && request.resource.data.role == 'client'
+        && request.resource.data.uid == uid
+        && request.resource.data.active == true
+        && request.resource.data.keys().hasOnly(['uid','name','phone','email','role','active','createdAt']);
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin()
+        || (hasRole('dispatcher') && resource.data.role == 'courier'));
+      allow update: if (isBoss() && (!('uid' in resource.data) || request.resource.data.uid == resource.data.uid)
+            && validRole(request.resource.data.role)
+            && (uid != request.auth.uid || (request.resource.data.role == 'boss' && request.resource.data.active == true)))
+        || (hasRole('admin') && validRole(request.resource.data.role) && request.resource.data.role != 'boss'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role','active','name','phone','updatedAt']))
         || (signedIn() && request.auth.uid == uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','phone','email','updatedAt'])
             && request.resource.data.role == resource.data.role
             && request.resource.data.active == resource.data.active);
-      allow delete: if isAdmin();
+      allow delete: if isBoss() && uid != request.auth.uid;
+    }
+
+    match /customerDirectory/{uid} {
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.uid == uid
+        && request.resource.data.keys().hasOnly(['uid','name','phone','createdAt','orderCount']);
+      allow read: if signedIn() && (request.auth.uid == uid || hasRole('cashier') || isAdmin());
+      allow update: if isAdmin()
+        || (signedIn() && request.auth.uid == uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','phone','orderCount'])
+            && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['orderCount'])
+                || request.resource.data.orderCount == resource.data.orderCount + 1)
+            && request.resource.data.uid == uid);
+      allow delete: if isBoss();
     }
 
     match /tariffs/{id} {
@@ -26,57 +62,63 @@ service cloud.firestore {
 
     match /orders/{id} {
       allow create: if signedIn() && isActive()
+        && userDoc().data.role == 'client'
         && request.resource.data.clientId == request.auth.uid
-        && request.resource.data.status == 'new';
+        && request.resource.data.status == 'new'
+        && request.resource.data.amount is number && request.resource.data.amount >= 0
+        && request.resource.data.items is list
+        && request.resource.data.keys().hasOnly(['clientId','clientName','phone','address','restaurantId','restaurant','items','amount','payment','comment','status','courierId','courierName','tariffId','tariffName','delivery','courierPay','servicePay','tariffSnapshot','createdAt','updatedAt']);
 
       allow read: if signedIn() && (
         resource.data.clientId == request.auth.uid
         || isAdmin()
-        || resource.data.courierId == request.auth.uid
-        || role('dispatcher')
-        || role('restaurant')
+        || hasRole('cashier')
+        || hasRole('dispatcher')
+        || (hasRole('courier') && resource.data.courierId == request.auth.uid)
+        || ((hasRole('kitchen') || hasRole('restaurant')) && resource.data.restaurantId == userDoc().data.restaurantId)
+        || (ownsRestaurant(resource.data.restaurantId))
       );
 
-      // Admin can manage an order. Other roles can only make operational
-      // changes appropriate to their role; clients cannot alter financial
-      // fields, assignment, restaurant, or order status.
       allow update: if isAdmin()
-        || (role('dispatcher') && request.resource.data.diff(resource.data).affectedKeys()
-            .hasOnly(['courierId','courierName','status','updatedAt']))
-        || (role('courier') && resource.data.courierId == request.auth.uid
-            && request.resource.data.diff(resource.data).affectedKeys()
-            .hasOnly(['status','updatedAt']))
-        || (role('restaurant')
-            && request.resource.data.restaurantId == resource.data.restaurantId
-            && request.resource.data.diff(resource.data).affectedKeys()
-            .hasOnly(['status','updatedAt']))
+        || (hasRole('cashier') && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','updatedAt'])
+            && request.resource.data.status == 'accepted')
+        || (hasRole('dispatcher') && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['courierId','courierName','status','updatedAt'])
+            && (request.resource.data.courierId == null
+                || (get(/databases/$(database)/documents/users/$(request.resource.data.courierId)).data.role == 'courier'
+                    && get(/databases/$(database)/documents/users/$(request.resource.data.courierId)).data.active != false)))
+        || (hasRole('courier') && resource.data.courierId == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','updatedAt'])
+            && request.resource.data.status in ['picked_up','delivered'])
+        || (((hasRole('kitchen') || hasRole('restaurant')) && resource.data.restaurantId == userDoc().data.restaurantId || ownsRestaurant(resource.data.restaurantId))
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','updatedAt'])
+            && request.resource.data.status in ['accepted','cooking','ready'])
         || (signedIn() && resource.data.clientId == request.auth.uid
-            && request.resource.data.diff(resource.data).affectedKeys()
-            .hasOnly(['comment','phone','address','updatedAt']));
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['comment','phone','address','updatedAt']));
 
-      allow delete: if isAdmin();
+      allow delete: if isBoss();
     }
 
     match /restaurants/{id} {
       allow read: if true;
       allow create: if isAdmin();
-      allow update, delete: if isAdmin()
-        || (role('restaurant') && resource.data.ownerId == request.auth.uid);
+      allow update, delete: if isAdmin() || ownsRestaurant(id);
       match /menu/{itemId} {
         allow read: if true;
-        allow create, update, delete: if isAdmin()
-          || (role('restaurant') && get(/databases/$(database)/documents/restaurants/$(id)).data.ownerId == request.auth.uid);
+        allow create, update: if isAdmin() || ownsRestaurant(id);
+        allow delete: if isAdmin() || ownsRestaurant(id);
       }
     }
 
     match /transactions/{id} {
       allow read: if isAdmin() || (signedIn() && resource.data.userId == request.auth.uid);
-      allow write: if isAdmin();
+      allow create, update, delete: if isAdmin();
     }
 
     match /settings/{id} {
       allow read: if true;
       allow write: if isAdmin();
     }
+
+    // All unspecified collections and documents are denied by default.
   }
 }
